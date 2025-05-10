@@ -20,7 +20,7 @@ PENDULUM_XML = """
         <body name="link1" pos="0 0 2.5">
             <joint name="pin1" type="hinge" axis="0 -1 0" pos="0 0 -0.5"/>
             <geom type="cylinder" size="0.05 0.5" rgba="0 .9 0 1" mass="1"/>
-            <body name="link2" pos="0 0 0.5">
+            <body name="link2" pos="0 0 1">
                 <joint name="pin2" type="hinge" axis="0 -1 0" pos="0 0 0"/>
                 <geom type="cylinder" size="0.05 0.5" rgba="0 0 .9 1" mass="1"/>
             </body>
@@ -115,70 +115,88 @@ def make_jitted_update(optimizer):
 barrier_opt = make_jitted_update(barrier_opt)
 controller_opt = make_jitted_update(controller_opt)
 
-# Dynamics function with custom VJP
+# Dynamics function with custom VJP using 4x4 Jacobian
 @jax.custom_vjp
-def dynamics(q, qd, u):
-    q = jnp.atleast_1d(q)
-    qd = jnp.atleast_1d(qd)
-    u = jnp.atleast_1d(u)
-    state = pipeline.init(sys, q, qd)
-    next_state = pipeline.step(sys, state, u)
-    return next_state.qpos, next_state.qvel
+def dynamics(state, u):
+    """
+    Compute the next state given the current state and control input.
+    
+    Args:
+        state: 4D array [q1, q2, qd1, qd2]
+        u: 2D array [u1, u2]
+    
+    Returns:
+        next_state: 4D array [next_q1, next_q2, next_qd1, next_qd2]
+    """
+    q = state[:2]
+    qd = state[2:]
+    state_brax = pipeline.init(sys, q, qd)
+    next_state_brax = pipeline.step(sys, state_brax, u)
+    return jnp.concatenate([next_state_brax.qpos, next_state_brax.qvel])
 
-def dynamics_fwd(q, qd, u):
-    next_q, next_qd = dynamics(q, qd, u)
-    return (next_q, next_qd), (q, qd, u)
+def dynamics_fwd(state, u):
+    """
+    Forward pass for the dynamics function.
+    
+    Returns:
+        next_state: The next state
+        (state, u): Residuals for backward pass
+    """
+    next_state = dynamics(state, u)
+    return next_state, (state, u)
 
-def dynamics_bwd(res, g):
-    q, qd, u = res
-    g_next_q, g_next_qd = g
+def dynamics_bwd(res, g_next_state):
+    """
+    Backward pass to compute gradients using finite differences.
+    
+    Args:
+        res: Tuple (state, u) from forward pass
+        g_next_state: Gradient of the loss w.r.t. next_state (4D)
+    
+    Returns:
+        dL_dstate: Gradient w.r.t. state (4D)
+        dL_du: Gradient w.r.t. control (2D)
+    """
+    state, u = res
     delta = 1e-5
-
-    # Jacobians w.r.t. q
-    dnext_q_dq = jnp.zeros((2, 2))
-    dnext_qd_dq = jnp.zeros((2, 2))
-    for i in range(2):
-        q_plus = q.at[i].add(delta)
-        q_minus = q.at[i].add(-delta)
-        next_q_plus, next_qd_plus = dynamics(q_plus, qd, u)
-        next_q_minus, next_qd_minus = dynamics(q_minus, qd, u)
-        dnext_q_dq = dnext_q_dq.at[:, i].set((next_q_plus - next_q_minus) / (2 * delta))
-        dnext_qd_dq = dnext_qd_dq.at[:, i].set((next_qd_plus - next_qd_minus) / (2 * delta))
-
-    # Jacobians w.r.t. qd
-    dnext_q_dqd = jnp.zeros((2, 2))
-    dnext_qd_dqd = jnp.zeros((2, 2))
-    for i in range(2):
-        qd_plus = qd.at[i].add(delta)
-        qd_minus = qd.at[i].add(-delta)
-        next_q_plus, next_qd_plus = dynamics(q, qd_plus, u)
-        next_q_minus, next_qd_minus = dynamics(q, qd_minus, u)
-        dnext_q_dqd = dnext_q_dqd.at[:, i].set((next_q_plus - next_q_minus) / (2 * delta))
-        dnext_qd_dqd = dnext_qd_dqd.at[:, i].set((next_qd_plus - next_qd_minus) / (2 * delta))
-
-    # Jacobians w.r.t. u
-    dnext_q_du = jnp.zeros((2, 2))
-    dnext_qd_du = jnp.zeros((2, 2))
+    
+    # Compute 4x4 Jacobian w.r.t. state
+    J_state = jnp.zeros((4, 4))
+    for i in range(4):
+        state_plus = state.at[i].add(delta)
+        state_minus = state.at[i].add(-delta)
+        next_state_plus = dynamics(state_plus, u)
+        next_state_minus = dynamics(state_minus, u)
+        diff = (next_state_plus - next_state_minus) / (2 * delta)
+        J_state = J_state.at[:, i].set(diff)
+    
+    # Compute 4x2 Jacobian w.r.t. u
+    J_u = jnp.zeros((4, 2))
     for j in range(2):
         u_plus = u.at[j].add(delta)
         u_minus = u.at[j].add(-delta)
-        next_q_plus, next_qd_plus = dynamics(q, qd, u_plus)
-        next_q_minus, next_qd_minus = dynamics(q, qd, u_minus)
-        dnext_q_du = dnext_q_du.at[:, j].set((next_q_plus - next_q_minus) / (2 * delta))
-        dnext_qd_du = dnext_qd_du.at[:, j].set((next_qd_plus - next_qd_minus) / (2 * delta))
-
-    # Compute gradients
-    dL_dq = dnext_q_dq.T @ g_next_q + dnext_qd_dq.T @ g_next_qd
-    dL_dqd = dnext_q_dqd.T @ g_next_q + dnext_qd_dqd.T @ g_next_qd
-    dL_du = dnext_q_du.T @ g_next_q + dnext_qd_du.T @ g_next_qd
-
-    return dL_dq, dL_dqd, dL_du
+        next_state_plus = dynamics(state, u_plus)
+        next_state_minus = dynamics(state, u_minus)
+        diff = (next_state_plus - next_state_minus) / (2 * delta)
+        J_u = J_u.at[:, j].set(diff)
+    
+    dL_dstate = J_state.T @ g_next_state
+    dL_du = J_u.T @ g_next_state
+    return dL_dstate, dL_du
 
 dynamics.defvjp(dynamics_fwd, dynamics_bwd)
 
 # Loss functions and training step
 @jax.jit
 def apply_models(barrier_params, controller_params, init, unsafe, safe, eta, gamma):
+    """
+    Compute losses and gradients for training.
+    
+    Returns:
+        barrier_grads: Gradients w.r.t. barrier parameters
+        controller_grads: Gradients w.r.t. controller parameters
+        loss: Total loss value
+    """
     def loss1_fn(barrier_params):
         bvalues = barrier(barrier_params, init)
         loss1 = jnp.mean((bvalues + eta) ** 2)
@@ -189,13 +207,10 @@ def apply_models(barrier_params, controller_params, init, unsafe, safe, eta, gam
         loss2 = jnp.mean((bvalues - eta) ** 2)
         return loss2
 
-    def single_loss3(barrier_params, controller_params, safe_single):
-        q = safe_single[:2]
-        qd = safe_single[2:]
-        u = controller(controller_params, safe_single)
-        next_q, next_qd = dynamics(q, qd, u)
-        next_obs = jnp.concatenate([next_q, next_qd])
-        bvalue = barrier(barrier_params, next_obs)
+    def single_loss3(barrier_params, controller_params, state):
+        u = controller(controller_params, state)
+        next_state = dynamics(state, u)
+        bvalue = barrier(barrier_params, next_state)
         loss3_single = (bvalue + eta) ** 2
         return loss3_single
 
@@ -269,13 +284,10 @@ def check_conditions(barrier, barrier_params, controller, controller_params, ini
     biggest_epsilon = eta_val / (lip2 / epsilon)
     print(f"the biggest epsilon where it would work is {biggest_epsilon}")
 
-    def single_loss3(barrier_params, controller_params, safe_single):
-        q = safe_single[:2]
-        qd = safe_single[2:]
-        u = controller(controller_params, safe_single)
-        next_q, next_qd = dynamics(q, qd, u)
-        next_obs = jnp.concatenate([next_q, next_qd])
-        bvalue = barrier(barrier_params, next_obs)
+    def single_loss3(barrier_params, controller_params, state):
+        u = controller(controller_params, state)
+        next_state = dynamics(state, u)
+        bvalue = barrier(barrier_params, next_state)
         loss3_single = bvalue <= -eta_val
         return loss3_single
 
